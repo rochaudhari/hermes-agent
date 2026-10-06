@@ -51,7 +51,7 @@ jobs:
           PY: ${{ steps.pm.outputs.python-path }}
         run: |
           "$PY" - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import json, statistics
+          import json, statistics, sys
           rows = [json.loads(l) for l in open("results.jsonl")]
           keys = ["bash_first_call_ms", "bash_repeat_call_median_ms", "bash_probes_next_calls",
                   "local_env_init_ms", "echo_median_ms", "echo_mean_ms", "bash_probes_during_echo"]
@@ -61,6 +61,8 @@ jobs:
           for k in keys:
               vals = {v: statistics.median(r[k] for r in rows if r["variant"] == v) for v in ("base", "fix")}
               print(f"| {k} | {vals['base']} | {vals['fix']} |")
+              print(f"::notice title=bench {k}::base={vals['base']} fix={vals['fix']}", file=sys.stderr)
+          print(f"::notice title=bench resolved_bash::{rows[0]['resolved_bash']} n={rows[0]['n']}", file=sys.stderr)
           print("\n<details><summary>raw</summary>\n\n```\n" + open("results.jsonl").read() + "```\n</details>")
           EOF
           cat "$GITHUB_STEP_SUMMARY"
