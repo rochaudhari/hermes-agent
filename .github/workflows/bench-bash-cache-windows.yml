@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          fetch-depth: 3
+          fetch-depth: 10
 
       - name: Set up locked Python
         id: pm
@@ -31,8 +31,8 @@ jobs:
           BENCH_N: '20'
         run: |
           set -euo pipefail
-          BASE=$(git rev-parse HEAD~2)
-          FIX=$(git rev-parse HEAD~1)
+          BASE=93cbf617c7007286a249cc00506c012933fb537c
+          FIX=ef1511295c3dc8a1a4760301564593d4c947c44e
           echo "base=$BASE fix=$FIX"
           git show "$BASE:pm/shell.py" > /tmp/shell_base.py
           git show "$FIX:pm/shell.py" > /tmp/shell_fix.py
