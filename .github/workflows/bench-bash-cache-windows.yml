@@ -1,0 +1,66 @@
+name: Bench pm.shell.bash() cache (Windows)
+
+on:
+  push:
+    branches:
+      - 'bench/bash-cache-windows'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 3
+
+      - name: Set up locked Python
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+
+      - name: Run base and fix, interleaved
+        shell: bash
+        env:
+          PY: ${{ steps.pm.outputs.python-path }}
+          BENCH_N: '20'
+        run: |
+          set -euo pipefail
+          BASE=$(git rev-parse HEAD~2)
+          FIX=$(git rev-parse HEAD~1)
+          echo "base=$BASE fix=$FIX"
+          git show "$BASE:pm/shell.py" > /tmp/shell_base.py
+          git show "$FIX:pm/shell.py" > /tmp/shell_fix.py
+          : > results.jsonl
+          for round in 1 2 3; do
+            for variant in base fix; do
+              cp "/tmp/shell_$variant.py" pm/shell.py
+              BENCH_VARIANT=$variant "$PY" bench/bash_cache_bench.py | tail -1 | tee -a results.jsonl
+            done
+          done
+          git checkout -- pm/shell.py
+
+      - name: Summarize
+        shell: bash
+        env:
+          PY: ${{ steps.pm.outputs.python-path }}
+        run: |
+          "$PY" - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, statistics
+          rows = [json.loads(l) for l in open("results.jsonl")]
+          keys = ["bash_first_call_ms", "bash_repeat_call_median_ms", "bash_probes_next_calls",
+                  "local_env_init_ms", "echo_median_ms", "echo_mean_ms", "bash_probes_during_echo"]
+          print("## pm.shell.bash() cache on windows-latest\n")
+          print(f"Resolved bash: `{rows[0]['resolved_bash']}`, n={rows[0]['n']} per run, 3 interleaved runs per variant (median of runs).\n")
+          print("| metric | base | fix |\n|---|---:|---:|")
+          for k in keys:
+              vals = {v: statistics.median(r[k] for r in rows if r["variant"] == v) for v in ("base", "fix")}
+              print(f"| {k} | {vals['base']} | {vals['fix']} |")
+          print("\n<details><summary>raw</summary>\n\n```\n" + open("results.jsonl").read() + "```\n</details>")
+          EOF
+          cat "$GITHUB_STEP_SUMMARY"
