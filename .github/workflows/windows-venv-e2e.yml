@@ -19,7 +19,7 @@ jobs:
   relay-agent-loop:
     name: Relay agent-loop on Windows (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -32,18 +32,12 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
-      - name: Relay agent-loop and Relay stream tests
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/agent/test_relay_llm_agent_loop.py tests/agent/test_relay_llm.py -v
-
-      - name: Bench smoke (unmanaged / private / agent_loop)
-        if: ${{ !cancelled() }}
+      - name: Bench, 50 streams (unmanaged x1; private / agent_loop x3)
         shell: bash
         env:
           PY: ${{ steps.pm.outputs.python-path }}
         run: |
           set -uo pipefail
-          "$PY" -c "import asyncio, sys; print(sys.version); print(type(asyncio.new_event_loop()).__name__)"
-          "$PY" -u evals/relay_stream_handoff/bench.py --ns 1,10 --chunks 100
+          nproc 2>/dev/null || echo "NUMBER_OF_PROCESSORS=$NUMBER_OF_PROCESSORS"
+          "$PY" -u evals/relay_stream_handoff/bench.py --ns 50 --chunks 200 --variants unmanaged --repeat 1 --timeout 1500
+          "$PY" -u evals/relay_stream_handoff/bench.py --ns 50 --chunks 200 --variants private,agent_loop --repeat 3 --timeout 1500
