@@ -992,9 +992,11 @@ class AIAgent(
             self.client = None
 
     def _close_request_clients(self, reason: str) -> None:
-        """Drop the cached per-request wire clients (reused across sequential LLM calls)."""
+        """Drop the cached per-request wire clients (reused across sequential LLM calls) and the Relay stream
+        loop that owns the async chat client."""
         _quietly(self._close_cached_request_openai_client, reason=reason)
         _quietly(self._close_cached_request_anthropic_client, reason=reason)
+        _quietly(self._close_relay_stream_loop, reason=reason)
 
     def _close_codex_session(self) -> None:
         """Close the Codex app-server session (else the child keeps running); the attribute is cleared BEFORE

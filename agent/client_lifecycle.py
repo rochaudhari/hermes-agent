@@ -190,6 +190,9 @@ class ClientLifecycleMixin:
         return build_keepalive_http_client(base_url, verify=verify)
 
     _create_openai_client = _forward("agent.agent_runtime_helpers", "create_openai_client")
+    _agent_stream_loop = _forward("agent.relay_llm_agent_loop", "agent_stream_loop")
+    _create_chat_stream_request_client = _forward("agent.relay_llm_agent_loop", "chat_stream_request_client")
+    _close_relay_stream_loop = _forward("agent.relay_llm_agent_loop", "close_agent_stream_loop")
     _force_close_tcp_sockets = _forward_static("agent.agent_runtime_helpers", "force_close_tcp_sockets")
     _cleanup_dead_connections = _forward("agent.agent_runtime_helpers_dead_connections", "cleanup_dead_connections")
     _run_codex_stream = _forward("agent.codex_runtime", "run_codex_stream")
@@ -265,6 +268,10 @@ class ClientLifecycleMixin:
                     abort(cached, reason=reason)
             except Exception:
                 logger.debug("Abandoned-worker drain: %s client abort failed", label, exc_info=True)
+        # A chat stream on the agent's Relay loop reads through that loop's async client, not the slot's.
+        holder = getattr(self, "_relay_agent_loop", None)
+        if holder is not None:
+            drained += holder.abort_in_flight()
         # Codex app-server session watches a private interrupt event.
         try:
             request_interrupt = getattr(getattr(self, "_codex_session", None), "request_interrupt", None)
@@ -464,7 +471,17 @@ class ClientLifecycleMixin:
         self._store_request_slot(_OPENAI_SLOT, client, snapshot)
         return client
 
+    def _request_slot_kwargs(self, client: Any) -> Optional[dict]:
+        """The kwargs snapshot the cached request client was built from, when ``client`` is that cached
+        (Hermes-built) client; None for an injected or untracked one."""
+        with self._openai_client_lock():
+            cache = self._request_slot(_OPENAI_SLOT)
+            return dict(cache["key"]) if cache["client"] is client else None
+
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        from agent.relay_llm_agent_loop import AgentLoopRequestClient
+        if isinstance(client, AgentLoopRequestClient):
+            return  # the agent's Relay stream loop owns that client and closes it on the loop
         if not self._release_request_slot(_OPENAI_SLOT, client, reason):
             self._close_openai_client(client, reason=reason, shared=False)
 

@@ -262,11 +262,23 @@ def stream_current(
     return managed
 
 
+def _run_on_loop_bounded(
+    loop: asyncio.AbstractEventLoop, coro_fn: Callable[[], Any], *, name: str, what: str
+) -> bool:
+    """Run ``coro_fn()`` on the idle ``loop`` from a daemon thread, bounded by ``_ACLOSE_TIMEOUT``.
+    Returns False when the attempt is abandoned: the daemon thread still owns the running loop,
+    so the caller must leave it open rather than ``loop.close()`` under it."""
+    try:
+        relay_runtime._run_on_daemon_thread(
+            lambda: loop.run_until_complete(coro_fn()), name=name, timeout=_ACLOSE_TIMEOUT)
+    except TimeoutError:
+        logger.warning("%s exceeded %ss; abandoning the attempt and its loop", what, _ACLOSE_TIMEOUT)
+        return False
+    return True
+
+
 def _aclose_on_loop(loop: asyncio.AbstractEventLoop, stream: Any) -> bool:
-    """Await ``stream.aclose()`` on ``loop`` when the stream exposes one, bounded by
-    ``_ACLOSE_TIMEOUT``. Returns False when the attempt is abandoned: the daemon
-    thread still owns the running loop, so the caller must leave it open rather
-    than ``loop.close()`` under it."""
+    """Await ``stream.aclose()`` on ``loop`` when the stream exposes one (``_run_on_loop_bounded``)."""
     close = getattr(stream, "aclose", None)
     if not callable(close):
         return True
@@ -274,27 +286,19 @@ def _aclose_on_loop(loop: asyncio.AbstractEventLoop, stream: Any) -> bool:
     async def close_stream() -> None:  # create the coroutine on ``loop``, not the caller's thread
         await close()
 
-    try:
-        relay_runtime._run_on_daemon_thread(
-            lambda: loop.run_until_complete(close_stream()),
-            name="relay-llm-stream-aclose", timeout=_ACLOSE_TIMEOUT,
-            timeout_message="Relay stream aclose did not finish; abandoning the close attempt",
-        )
-    except TimeoutError:
-        logger.warning(
-            "Relay stream aclose exceeded %ss; abandoning the close attempt and its private loop",
-            _ACLOSE_TIMEOUT,
-        )
-        return False
-    return True
+    return _run_on_loop_bounded(loop, close_stream, name="relay-llm-stream-aclose", what="Relay stream aclose")
 
 
-def _next_provider_chunk(callback: Callable[..., Any], raw_iterator: Any) -> tuple[Any, bool]:
-    """Read one synchronous provider chunk without leaking StopIteration through a Future."""
+_EXHAUSTED = object()
+
+
+def _next_provider_chunk(callback: Callable[..., Any], raw_iterator: Any) -> Any:
+    """Read one synchronous provider chunk (``_EXHAUSTED`` at the end) without leaking StopIteration
+    through a Future."""
     try:
-        return callback(next, raw_iterator), False
+        return callback(next, raw_iterator)
     except StopIteration:
-        return None, True
+        return _EXHAUSTED
 
 
 class ManagedLlmStream(Iterator[Any]):
@@ -303,6 +307,7 @@ class ManagedLlmStream(Iterator[Any]):
     final_response: Any = None
     output_modified = _closed = _provider_completed = _delivered_unmatched = False
     _loop: asyncio.AbstractEventLoop | None = None
+    _loop_owner: Any = None  # the agent's AgentStreamLoop when this stream runs on it, else a private loop
     _stream = _raw_stream_resource = None
     _runtime_lease: relay_runtime.RelayOperationLease | None = None
     _close_error = _callback_error = None  # BaseException | None
@@ -315,7 +320,7 @@ class ManagedLlmStream(Iterator[Any]):
         on_stream_created: Callable[[Any], None] | None = None, on_chunk: Callable[[Any], None] | None = None,
         chunk_adapter: Callable[[Any], Any] | None = None, accept_chunk: Callable[[Any], bool] | None = None,
         completed_response_predicate: Callable[[Any], bool] | None = None,
-        metadata: dict[str, Any] | None = None, defer_logical_completion: bool = False,
+        metadata: dict[str, Any] | None = None, defer_logical_completion: bool = False, agent_loop: Any = None,
     ) -> None:
         self._defer_logical_completion = defer_logical_completion
         # Only auxiliary calls report model/provider on their logical scope.
@@ -331,7 +336,7 @@ class ManagedLlmStream(Iterator[Any]):
             self._start_unmanaged(request)
             return
         self._logical = attempt.logical
-        self._start_managed(attempt)
+        self._start_managed(attempt, agent_loop)
 
     def _start_unmanaged(self, request: dict[str, Any]) -> None:
         raw_stream = self._stream_factory(request)
@@ -350,7 +355,9 @@ class ManagedLlmStream(Iterator[Any]):
         run_callback = attempt.run_callback
         raw_stream = None
         try:
-            raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+            opened = run_callback(self._stream_factory, attempt.provider_request(next_request))
+            # An async request client on the agent's loop (relay_llm_agent_loop) opens on this loop.
+            raw_stream = await opened if inspect.isawaitable(opened) else opened
             predicate = self._completed_response_predicate
             if predicate is not None and run_callback(predicate, raw_stream):
                 self.final_response = raw_stream
@@ -358,14 +365,15 @@ class ManagedLlmStream(Iterator[Any]):
                 return
             if self._on_stream_created is not None:
                 run_callback(self._on_stream_created, raw_stream)
-            raw_iterator = run_callback(iter, raw_stream)
-            while True:
+            if hasattr(raw_stream, "__anext__"):
+                # Read on this loop by the thread driving the stream: no hand-off per chunk.
+                next_chunk = partial(anext, raw_stream, _EXHAUSTED)
+            else:
                 # Off the loop: Relay pulls the next provider chunk before it hands over the
                 # current one, so a blocking read here withholds each chunk until the provider
                 # sends the next. Text vanishes for every provider pause and a steer aborts it.
-                chunk, exhausted = await asyncio.to_thread(_next_provider_chunk, run_callback, raw_iterator)
-                if exhausted:
-                    break
+                next_chunk = partial(asyncio.to_thread, _next_provider_chunk, run_callback, run_callback(iter, raw_stream))
+            while (chunk := await next_chunk()) is not _EXHAUSTED:
                 if self._accept_chunk is not None and not run_callback(self._accept_chunk, chunk):
                     break
                 encoded_chunk = _jsonable(chunk)
@@ -379,7 +387,9 @@ class ManagedLlmStream(Iterator[Any]):
             close = getattr(raw_stream, "close", None)
             if callable(close):
                 try:
-                    run_callback(close)
+                    closed = run_callback(close)
+                    if inspect.isawaitable(closed):
+                        await closed
                 except BaseException as exc:
                     self._close_error = exc
                     raise
@@ -400,8 +410,9 @@ class ManagedLlmStream(Iterator[Any]):
             self._callback_error = exc
             raise
 
-    def _start_managed(self, attempt: _ManagedAttempt) -> None:
-        """Open Relay's stream on a private event loop owned by this iterator."""
+    def _start_managed(self, attempt: _ManagedAttempt, agent_loop: Any = None) -> None:
+        """Open Relay's stream on the agent's loop when free (``agent_loop``: a relay_llm_agent_loop
+        AgentStreamLoop), else a private loop owned by this iterator."""
 
         def observe_chunk(chunk: Any) -> None:
             if self._on_chunk is not None:
@@ -409,7 +420,9 @@ class ManagedLlmStream(Iterator[Any]):
 
         self._runtime_lease = attempt.runtime.acquire_operation_lease()
         try:
-            self._loop = loop = asyncio.new_event_loop()
+            loop = agent_loop.acquire() if agent_loop is not None else None
+            self._loop_owner = agent_loop if loop is not None else None
+            self._loop = loop = loop or asyncio.new_event_loop()
             self._stream = loop.run_until_complete(
                 attempt.run_managed(
                     attempt.runtime.relay.llm.stream_execute, partial(self._provider_stream, attempt),
@@ -423,7 +436,7 @@ class ManagedLlmStream(Iterator[Any]):
             try:
                 if self._loop is not None:
                     self._finish_logical("cancelled" if _is_cancellation(exc) else "failed", error=exc)
-                    self._loop.close()
+                    self._release_loop(self._loop, abandoned=False)
             finally:
                 self._loop = None
                 self._release_runtime_lease()
@@ -543,8 +556,7 @@ class ManagedLlmStream(Iterator[Any]):
                 except Exception:
                     logger.debug("Relay stream cleanup failed during provider fallback", exc_info=True)
                     completed = True
-                if completed:
-                    loop.close()
+                self._release_loop(loop, abandoned=not completed)
             self._finish_logical("success")
         finally:
             self._release_runtime_lease()
@@ -574,19 +586,27 @@ class ManagedLlmStream(Iterator[Any]):
         self._prefetched_chunks.clear()
         try:
             loop, self._loop = self._loop, None
-            close_loop = loop is not None
+            completed = True
             if loop is None:
                 self._close_provider_resources()
             else:
                 try:
-                    close_loop = _aclose_on_loop(loop, self._stream)
+                    completed = _aclose_on_loop(loop, self._stream)
                 except Exception as exc:
                     self._keep_first_close_error(exc)
             self._finish_logical(logical_outcome, error)
-            if close_loop:
-                loop.close()
+            if loop is not None:
+                self._release_loop(loop, abandoned=not completed)
         finally:
             self._release_runtime_lease()
+
+    def _release_loop(self, loop: asyncio.AbstractEventLoop, *, abandoned: bool) -> None:
+        """Close a private loop or hand the agent's back. ``abandoned``: a timed-out close left the loop
+        running on a daemon thread, so it must not be closed under it."""
+        if self._loop_owner is not None:
+            self._loop_owner.release(loop, abandoned=abandoned)
+        elif not abandoned:
+            loop.close()
 
     def _release_runtime_lease(self) -> None:
         lease, self._runtime_lease = self._runtime_lease, None

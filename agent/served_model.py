@@ -48,10 +48,18 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
         except Exception:
             logger.debug("served-model header capture skipped", exc_info=True)
 
-    setattr(_on_response, _HOOK_MARK, True)
+    import httpx
+
+    hook = _on_response
+    if isinstance(http_client, httpx.AsyncClient):  # httpx awaits an async client's hooks
+
+        async def hook(response: Any) -> None:
+            _on_response(response)
+
+    setattr(hook, _HOOK_MARK, True)
     try:
         # httpx copies on assignment; rebuild the mapping instead of mutating the live list.
-        http_client.event_hooks = {**hooks, "response": [*hooks.get("response", ()), _on_response]}
+        http_client.event_hooks = {**hooks, "response": [*hooks.get("response", ()), hook]}
     except Exception:
         logger.debug("served-model hook install skipped", exc_info=True)
 

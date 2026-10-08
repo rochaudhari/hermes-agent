@@ -3008,7 +3008,7 @@ class _StreamingCall(StreamingWaitMonitor):
         if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
-            self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
+            self.agent._create_chat_stream_request_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
         # #93650: as above — the streaming path carries the same bulk
@@ -3127,7 +3127,7 @@ class _StreamingCall(StreamingWaitMonitor):
             **_relay_stream_identity(self.agent, "provider"), finalizer=relay_response.finalize,
             on_stream_created=self._chat_stream_created, on_chunk=relay_response.observe,
             accept_chunk=lambda chunk: self._accept_chat_chunk(stream_attempt_id, chunk),
-            completed_response_predicate=lambda value: hasattr(value, "choices"),
+            completed_response_predicate=lambda value: hasattr(value, "choices"), agent_loop=self.agent._agent_stream_loop(),
             metadata=_relay_stream_metadata(self.agent, "chat_completions"), defer_logical_completion=True))
         if self.agent.provider == "moa":
             # Hermes interrupts the managed stream; Relay alone closes the provider stream.

@@ -24,11 +24,17 @@ def async_api_key(sync_client: Any) -> Any:
     so the callable is run off-loop (it may shell out to a ``key_cmd``).
     """
     provider = getattr(sync_client, "_api_key_provider", None) if isinstance(sync_client, OpenAI) else None
-    if not callable(provider):
-        return sync_client.api_key
+    return async_credential(provider) if callable(provider) else sync_client.api_key
+
+
+def async_credential(api_key: Any) -> Any:
+    """``AsyncOpenAI`` form of a sync ``api_key`` value: a ``Callable[[], str]`` token provider is wrapped
+    for ``await`` and run off-loop (it may shell out to a ``key_cmd``); a static key passes through."""
+    if not callable(api_key):
+        return api_key
 
     async def _provide() -> str:
-        return str(await asyncio.to_thread(provider))
+        return str(await asyncio.to_thread(api_key))
 
     return _provide
 
